@@ -7,6 +7,37 @@
 
 ---
 
+## ⚡ QUICK VALIDATION (Run These First!)
+
+Verify everything is working with these quick tests:
+
+### 1. Validation Suite (Fastest - 8 checks in ~2s)
+```powershell
+.\scripts\validate-jules-chain.ps1
+```
+Should print: **8/8 PASSED**
+
+### 2. Logger Test (Zero config required)
+```powershell
+npm run test:logger              # JSON format
+LOG_FORMAT=pretty npm run test:logger   # Human-readable
+```
+
+### 3. MCP Status Check
+```powershell
+Invoke-RestMethod http://localhost:3000/api/v1/mcp/status
+```
+Should show: **5 servers, 25 tools, all operational**
+
+### 4. ChromaDB Health (Optional)
+```powershell
+Invoke-RestMethod http://localhost:8000/api/v1/heartbeat
+```
+
+**✅ If all pass, your MCP Tool Chain is 100% operational!**
+
+---
+
 ## 🚀 QUICK START
 
 Your application is running at: **http://localhost:3000**
