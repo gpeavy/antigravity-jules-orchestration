@@ -4,6 +4,7 @@ import pg from 'pg';
 import axios from 'axios';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
+import { GoogleAuth } from 'google-auth-library';
 import * as metrics from './metrics.js';
 
 const app = express();
@@ -28,6 +29,11 @@ app.get('/api/v1/metrics', async (req, res) => {
   res.end(await metrics.getMetrics());
 });
 
+// Initialize Google Auth
+const auth = new GoogleAuth({
+  scopes: 'https://www.googleapis.com/auth/cloud-platform'
+});
+
 // Jules API client
 const julesClient = axios.create({
   baseURL: 'https://jules.googleapis.com/v1alpha',
@@ -37,11 +43,25 @@ const julesClient = axios.create({
 });
 
 // Add auth interceptor
-julesClient.interceptors.request.use((config) => {
-  if (JULES_API_KEY) {
-    config.headers.Authorization = 'Bearer ' + JULES_API_KEY;
+julesClient.interceptors.request.use(async (config) => {
+  try {
+    // Get the client and headers (automatically uses GOOGLE_APPLICATION_CREDENTIALS_JSON or ADC)
+    const client = await auth.getClient();
+    const headers = await client.getRequestHeaders();
+    
+    // If JULES_API_KEY is still set and no Service Account, fallback (though likely to fail if OAuth required)
+    if (!headers.Authorization && JULES_API_KEY) {
+        config.headers.Authorization = `Bearer ${JULES_API_KEY}`;
+    } else {
+        config.headers.Authorization = headers.Authorization;
+    }
+    
+    console.log(`[Jules Client] Requesting ${config.url} with Auth: ${config.headers.Authorization ? 'Present' : 'Missing'}`);
+    return config;
+  } catch (error) {
+    console.error('[Jules Client] Auth Error:', error.message);
+    return Promise.reject(error);
   }
-  return config;
 });
 
 // GitHub API client
@@ -87,7 +107,7 @@ app.get(['/health', '/api/v1/health'], async (req, res) => {
     version: '1.2.0',
     services: {
       database: dbStatus,
-      julesApi: JULES_API_KEY ? 'configured' : 'not_configured',
+      julesApi: 'configured',
       githubApi: GITHUB_TOKEN ? 'configured' : 'not_configured'
     },
     timestamp: new Date().toISOString() 
@@ -242,7 +262,7 @@ server.listen(PORT, () => {
   console.log('Jules Orchestrator API running on port ' + PORT);
   console.log('Health check: http://localhost:' + PORT + '/api/v1/health');
   console.log('MCP Tools: http://localhost:' + PORT + '/mcp/tools');
-  console.log('Jules API Key: ' + (JULES_API_KEY ? 'Configured' : 'Not set'));
+  console.log('Jules API Auth: Configured with GoogleAuth');
   console.log('GitHub Token: ' + (GITHUB_TOKEN ? 'Configured' : 'Not set'));
   console.log('Database: ' + (DATABASE_URL ? 'Configured' : 'Not set'));
 });
