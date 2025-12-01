@@ -1,42 +1,11 @@
 import express from 'express';
 import dotenv from 'dotenv';
 import https from 'https';
-import { GoogleAuth } from 'google-auth-library';
 
 dotenv.config();
 
 const PORT = process.env.PORT || 3323;
-
-// Initialize Google Auth from service account JSON
-let auth;
-let authConfigured = false;
-
-try {
-  const credentialsJson = process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
-  if (credentialsJson) {
-    const credentials = JSON.parse(credentialsJson);
-    auth = new GoogleAuth({
-      credentials,
-      scopes: ['https://www.googleapis.com/auth/cloud-platform']
-    });
-    authConfigured = true;
-    console.log('Google Auth initialized from GOOGLE_APPLICATION_CREDENTIALS_JSON');
-  } else {
-    console.warn('GOOGLE_APPLICATION_CREDENTIALS_JSON not set - Jules API calls will fail');
-  }
-} catch (error) {
-  console.error('Failed to initialize Google Auth:', error.message);
-}
-
-// Get fresh OAuth2 access token
-async function getAccessToken() {
-  if (!auth) {
-    throw new Error('Google Auth not configured - set GOOGLE_APPLICATION_CREDENTIALS_JSON');
-  }
-  const client = await auth.getClient();
-  const tokenResponse = await client.getAccessToken();
-  return tokenResponse.token;
-}
+const JULES_API_KEY = process.env.JULES_API_KEY;
 
 const app = express();
 app.use(express.json());
@@ -46,10 +15,10 @@ app.get('/', (req, res) => {
   res.json({
     status: 'healthy',
     service: 'Jules MCP Server',
-    version: '1.2.0',
+    version: '1.3.0',
     timestamp: new Date().toISOString(),
-    capabilities: ['sessions', 'tasks', 'orchestration', 'mcp-protocol'],
-    authMethod: 'google-oauth2'
+    capabilities: ['sessions', 'tasks', 'orchestration', 'mcp-protocol', 'sources'],
+    authMethod: 'api-key'
   });
 });
 
@@ -57,7 +26,7 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    googleAuthConfigured: authConfigured,
+    apiKeyConfigured: !!JULES_API_KEY,
     timestamp: new Date().toISOString()
   });
 });
@@ -66,9 +35,9 @@ app.get('/health', (req, res) => {
 app.get('/api/v1/health', (req, res) => {
   res.json({
     status: 'ok',
-    version: '1.2.0',
+    version: '1.3.0',
     services: {
-      julesApi: authConfigured ? 'configured' : 'not configured',
+      julesApi: JULES_API_KEY ? 'configured' : 'not configured',
       database: 'not required'
     },
     timestamp: new Date().toISOString()
@@ -80,18 +49,21 @@ app.get('/mcp/tools', (req, res) => {
   res.json({
     tools: [
       {
+        name: 'jules_list_sources',
+        description: 'List all connected GitHub repositories (sources)',
+        parameters: {}
+      },
+      {
         name: 'jules_create_session',
         description: 'Create a new Jules coding session for autonomous development',
         parameters: {
-          repository: { type: 'string', required: true, description: 'GitHub repository (owner/repo)' },
-          task: { type: 'string', required: true, description: 'Task description for Jules' },
-          branch: { type: 'string', required: false, description: 'Target branch (default: main)' },
-          autoApprove: { type: 'boolean', required: false, description: 'Auto-approve changes' }
+          source: { type: 'string', required: true, description: 'Source name (e.g., sources/github/owner/repo)' },
+          task: { type: 'string', required: true, description: 'Task description for Jules' }
         }
       },
       {
         name: 'jules_list_sessions',
-        description: 'List all active Jules sessions',
+        description: 'List all Jules sessions',
         parameters: {}
       },
       {
@@ -99,6 +71,14 @@ app.get('/mcp/tools', (req, res) => {
         description: 'Get details of a specific session',
         parameters: {
           sessionId: { type: 'string', required: true, description: 'Session ID to retrieve' }
+        }
+      },
+      {
+        name: 'jules_send_message',
+        description: 'Send a message to an existing Jules session',
+        parameters: {
+          sessionId: { type: 'string', required: true, description: 'Session ID' },
+          message: { type: 'string', required: true, description: 'Message to send' }
         }
       }
     ]
@@ -113,9 +93,16 @@ app.post('/mcp/execute', async (req, res) => {
     return res.status(400).json({ error: 'Tool name required' });
   }
 
+  if (!JULES_API_KEY) {
+    return res.status(500).json({ error: 'JULES_API_KEY not configured' });
+  }
+
   try {
     let result;
     switch (tool) {
+      case 'jules_list_sources':
+        result = await listSources();
+        break;
       case 'jules_create_session':
         result = await createJulesSession(parameters);
         break;
@@ -124,6 +111,9 @@ app.post('/mcp/execute', async (req, res) => {
         break;
       case 'jules_get_session':
         result = await getJulesSession(parameters.sessionId);
+        break;
+      case 'jules_send_message':
+        result = await sendMessage(parameters.sessionId, parameters.message);
         break;
       default:
         return res.status(400).json({ error: 'Unknown tool: ' + tool });
@@ -134,113 +124,81 @@ app.post('/mcp/execute', async (req, res) => {
   }
 });
 
-// Jules API integration functions
-async function createJulesSession(config) {
-  const accessToken = await getAccessToken();
-
-  const sessionData = {
-    repository: config.repository,
-    task: config.task || 'Autonomous development workflow',
-    autoApprove: config.autoApprove || false,
-    branch: config.branch || 'main'
-  };
-
+// Jules API helper - make authenticated request
+function julesRequest(method, path, body = null) {
   return new Promise((resolve, reject) => {
-    const data = JSON.stringify(sessionData);
-
     const options = {
       hostname: 'jules.googleapis.com',
       port: 443,
-      path: '/v1alpha/sessions',
-      method: 'POST',
+      path: '/v1alpha' + path,
+      method: method,
       headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': data.length,
-        'Authorization': 'Bearer ' + accessToken
+        'X-Goog-Api-Key': JULES_API_KEY,
+        'Content-Type': 'application/json'
       }
     };
 
     const req = https.request(options, (response) => {
-      let body = '';
-      response.on('data', chunk => body += chunk);
+      let data = '';
+      response.on('data', chunk => data += chunk);
       response.on('end', () => {
-        if (response.statusCode === 200 || response.statusCode === 201) {
-          resolve(JSON.parse(body));
+        if (response.statusCode >= 200 && response.statusCode < 300) {
+          try {
+            resolve(JSON.parse(data));
+          } catch {
+            resolve(data);
+          }
         } else {
-          reject(new Error('Jules API error: ' + response.statusCode + ' - ' + body));
+          reject(new Error('Jules API error: ' + response.statusCode + ' - ' + data));
         }
       });
     });
 
     req.on('error', reject);
-    req.write(data);
+    
+    if (body) {
+      const jsonBody = JSON.stringify(body);
+      req.setHeader('Content-Length', Buffer.byteLength(jsonBody));
+      req.write(jsonBody);
+    }
     req.end();
   });
 }
 
+// List all connected sources (repositories)
+async function listSources() {
+  return await julesRequest('GET', '/sources');
+}
+
+// Create a new Jules session
+async function createJulesSession(config) {
+  const sessionData = {
+    source: config.source,
+    task: config.task
+  };
+  return await julesRequest('POST', '/sessions', sessionData);
+}
+
+// List all sessions
 async function listJulesSessions() {
-  const accessToken = await getAccessToken();
-
-  return new Promise((resolve, reject) => {
-    const options = {
-      hostname: 'jules.googleapis.com',
-      port: 443,
-      path: '/v1alpha/sessions',
-      method: 'GET',
-      headers: { 'Authorization': 'Bearer ' + accessToken }
-    };
-
-    const req = https.request(options, (response) => {
-      let body = '';
-      response.on('data', chunk => body += chunk);
-      response.on('end', () => {
-        if (response.statusCode === 200) {
-          resolve(JSON.parse(body));
-        } else {
-          reject(new Error('Jules API error: ' + response.statusCode + ' - ' + body));
-        }
-      });
-    });
-
-    req.on('error', reject);
-    req.end();
-  });
+  return await julesRequest('GET', '/sessions');
 }
 
+// Get session details
 async function getJulesSession(sessionId) {
-  const accessToken = await getAccessToken();
+  return await julesRequest('GET', '/sessions/' + sessionId);
+}
 
-  return new Promise((resolve, reject) => {
-    const options = {
-      hostname: 'jules.googleapis.com',
-      port: 443,
-      path: '/v1alpha/sessions/' + sessionId,
-      method: 'GET',
-      headers: { 'Authorization': 'Bearer ' + accessToken }
-    };
-
-    const req = https.request(options, (response) => {
-      let body = '';
-      response.on('data', chunk => body += chunk);
-      response.on('end', () => {
-        if (response.statusCode === 200) {
-          resolve(JSON.parse(body));
-        } else {
-          reject(new Error('Jules API error: ' + response.statusCode + ' - ' + body));
-        }
-      });
-    });
-
-    req.on('error', reject);
-    req.end();
-  });
+// Send message to session
+async function sendMessage(sessionId, message) {
+  return await julesRequest('POST', '/sessions/' + sessionId + ':sendMessage', { message });
 }
 
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log('Jules MCP Server running on port ' + PORT);
   console.log('Health check: http://localhost:' + PORT + '/health');
   console.log('MCP Tools: http://localhost:' + PORT + '/mcp/tools');
-  console.log('Google Auth configured: ' + (authConfigured ? 'Yes' : 'No'));
+  console.log('Jules API Key configured: ' + (JULES_API_KEY ? 'Yes' : 'No'));
 });
 
 process.on('SIGTERM', () => {
