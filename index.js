@@ -6,7 +6,7 @@ dotenv.config();
 
 const PORT = process.env.PORT || 3323;
 const JULES_API_KEY = process.env.JULES_API_KEY;
-const VERSION = '1.4.0';
+const VERSION = '1.4.1';
 
 const app = express();
 app.use(express.json());
@@ -220,19 +220,40 @@ function julesRequest(method, path, body = null) {
 
 // Create a new Jules session with correct API schema
 async function createJulesSession(config) {
+  // Determine the starting branch - required by Jules API
+  let startingBranch = config.branch;
+
+  // If no branch specified, fetch the default branch from source info
+  if (!startingBranch) {
+    console.log('[Jules API] No branch specified, fetching default branch from source...');
+    try {
+      const sources = await julesRequest('GET', '/sources');
+      const source = sources.sources?.find(s => s.name === config.source);
+      if (source?.githubRepo?.defaultBranch?.displayName) {
+        startingBranch = source.githubRepo.defaultBranch.displayName;
+        console.log('[Jules API] Using default branch:', startingBranch);
+      } else {
+        // Fallback to common defaults
+        startingBranch = 'main';
+        console.log('[Jules API] No default branch found, using fallback:', startingBranch);
+      }
+    } catch (err) {
+      console.error('[Jules API] Failed to fetch source info:', err.message);
+      startingBranch = 'main';
+    }
+  }
+
   const sessionData = {
     prompt: config.prompt,
     sourceContext: {
-      source: config.source
+      source: config.source,
+      githubRepoContext: {
+        startingBranch: startingBranch
+      }
     }
   };
 
   // Add optional fields
-  if (config.branch) {
-    sessionData.sourceContext.githubRepoContext = {
-      startingBranch: config.branch
-    };
-  }
   if (config.title) {
     sessionData.title = config.title;
   }
