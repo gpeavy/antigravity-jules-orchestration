@@ -1,11 +1,9 @@
 // orchestrator-api/src/index.js
 import express from 'express';
-import { createClient } from 'redis';
 import pg from 'pg';
 import axios from 'axios';
 import { WebSocketServer } from 'ws';
 import { createServer } from 'http';
-import { GoogleAuth } from 'google-auth-library';
 import * as metrics from './metrics.js';
 
 const app = express();
@@ -15,13 +13,14 @@ app.use(express.json());
 const JULES_API_KEY = process.env.JULES_API_KEY;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
-const REDIS_URL = process.env.REDIS_URL;
 const PORT = process.env.PORT || 3000;
 
-// Initialize clients
-const db = new pg.Pool({ connectionString: DATABASE_URL });
-const redis = createClient({ url: REDIS_URL });
-await redis.connect();
+// Initialize database (optional - graceful fallback)
+let db = null;
+if (DATABASE_URL) {
+  db = new pg.Pool({ connectionString: DATABASE_URL });
+  console.log('Database configured');
+}
 
 // Metrics Endpoint
 app.get('/api/v1/metrics', async (req, res) => {
@@ -29,46 +28,35 @@ app.get('/api/v1/metrics', async (req, res) => {
   res.end(await metrics.getMetrics());
 });
 
-// Initialize Google Auth
-const auth = new GoogleAuth({
-  scopes: 'https://www.googleapis.com/auth/cloud-platform'
-});
-
-// Jules API client with Auth Interceptor
+// Jules API client
 const julesClient = axios.create({
-  baseURL: 'https://jules.googleapis.com/v1alpha', // Updated to correct endpoint
-  headers: { 'Content-Type': 'application/json' }
+  baseURL: 'https://jules.googleapis.com/v1alpha',
+  headers: { 
+    'Content-Type': 'application/json'
+  }
 });
 
-// Add interceptor to inject the latest token
-julesClient.interceptors.request.use(async (config) => {
-  try {
-    // Get the client and headers (automatically uses GOOGLE_APPLICATION_CREDENTIALS_JSON or ADC)
-    const client = await auth.getClient();
-    const headers = await client.getRequestHeaders();
-    
-    // If JULES_API_KEY is still set and no Service Account, fallback (though likely to fail if OAuth required)
-    if (!headers.Authorization && JULES_API_KEY) {
-        config.headers.Authorization = `Bearer ${JULES_API_KEY}`;
-    } else {
-        config.headers.Authorization = headers.Authorization;
-    }
-    
-    console.log(`[Jules Client] Requesting ${config.url} with Auth: ${config.headers.Authorization ? 'Present' : 'Missing'}`);
-    return config;
-  } catch (error) {
-    console.error('[Jules Client] Auth Error:', error.message);
-    return Promise.reject(error);
+// Add auth interceptor
+julesClient.interceptors.request.use((config) => {
+  if (JULES_API_KEY) {
+    config.headers.Authorization = 'Bearer ' + JULES_API_KEY;
   }
+  return config;
 });
 
 // GitHub API client
 const githubClient = axios.create({
   baseURL: 'https://api.github.com',
   headers: { 
-    'Authorization': `Bearer ${GITHUB_TOKEN}`,
     'Accept': 'application/vnd.github+json'
   }
+});
+
+githubClient.interceptors.request.use((config) => {
+  if (GITHUB_TOKEN) {
+    config.headers.Authorization = 'Bearer ' + GITHUB_TOKEN;
+  }
+  return config;
 });
 
 // Root Endpoint (Service Metadata)
@@ -76,19 +64,31 @@ app.get('/', (req, res) => {
   res.json({
     status: 'healthy',
     service: 'Jules MCP Server',
-    version: '1.1.0',
+    version: '1.2.0',
     capabilities: ['sessions', 'tasks', 'orchestration', 'mcp-protocol'],
     timestamp: new Date().toISOString()
   });
 });
 
 // Health Check
-app.get(['/health', '/api/v1/health'], (req, res) => {
+app.get(['/health', '/api/v1/health'], async (req, res) => {
+  let dbStatus = 'not_configured';
+  if (db) {
+    try {
+      await db.query('SELECT 1');
+      dbStatus = 'connected';
+    } catch (e) {
+      dbStatus = 'error: ' + e.message;
+    }
+  }
+  
   res.json({ 
-    status: 'ok', 
+    status: 'ok',
+    version: '1.2.0',
     services: {
-      database: 'connected', // Simplified for now, real check would ping DB
-      redis: 'connected'
+      database: dbStatus,
+      julesApi: JULES_API_KEY ? 'configured' : 'not_configured',
+      githubApi: GITHUB_TOKEN ? 'configured' : 'not_configured'
     },
     timestamp: new Date().toISOString() 
   });
@@ -137,28 +137,42 @@ app.get('/mcp/tools', (req, res) => {
 
 // MCP Tool Execution
 app.post('/mcp/execute', async (req, res) => {
-  const { name, arguments: args } = req.body;
+  const { name, arguments: args, tool, parameters } = req.body;
+  
+  // Support both MCP formats
+  const toolName = name || tool;
+  const toolArgs = args || parameters || {};
+  
+  if (!toolName) {
+    return res.status(400).json({ error: 'Tool name required (use "name" or "tool" field)' });
+  }
   
   try {
     let result;
-    if (name === 'jules_create_session') {
-      // Proxy to Jules API
-      const response = await julesClient.post('/sessions', args);
+    if (toolName === 'jules_create_session') {
+      const response = await julesClient.post('/sessions', toolArgs);
       result = response.data;
-    } else if (name === 'jules_list_sessions') {
+    } else if (toolName === 'jules_list_sessions') {
       const response = await julesClient.get('/sessions');
       result = response.data;
-    } else if (name === 'jules_get_session') {
-      const response = await julesClient.get(`/sessions/${args.sessionId}`);
+    } else if (toolName === 'jules_get_session') {
+      const response = await julesClient.get('/sessions/' + toolArgs.sessionId);
       result = response.data;
     } else {
-      return res.status(404).json({ error: `Tool ${name} not found` });
+      return res.status(404).json({ error: 'Tool ' + toolName + ' not found' });
     }
     
-    res.json({ content: [{ type: "text", text: JSON.stringify(result, null, 2) }] });
+    res.json({ 
+      success: true,
+      content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      result 
+    });
   } catch (error) {
-    console.error(`MCP Execute Error (${name}):`, error.message);
-    res.status(500).json({ error: error.message });
+    console.error('MCP Execute Error (' + toolName + '):', error.response?.data || error.message);
+    res.status(500).json({ 
+      success: false,
+      error: error.response?.data?.error?.message || error.message 
+    });
   }
 });
 
@@ -166,296 +180,69 @@ app.post('/mcp/execute', async (req, res) => {
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Track connected clients
 const clients = new Set();
 
 wss.on('connection', (ws) => {
   clients.add(ws);
-  console.log('Client connected');
-  
-  // Send initial stats
-  sendStats(ws);
+  console.log('WebSocket client connected');
   
   ws.on('close', () => {
     clients.delete(ws);
-    console.log('Client disconnected');
+    console.log('WebSocket client disconnected');
   });
 });
 
-// Broadcast to all clients
 function broadcast(data) {
   clients.forEach(client => {
-    if (client.readyState === 1) { // OPEN
+    if (client.readyState === 1) {
       client.send(JSON.stringify(data));
     }
   });
 }
 
-// Send workflow updates via WebSocket
-async function notifyWorkflowUpdate(workflowId, data) {
-  broadcast({
-    type: 'workflow_update',
-    workflow_id: workflowId,
-    data,
-    timestamp: new Date().toISOString()
-  });
-}
-
-// Update stats broadcast
-async function sendStats(ws = null) {
-  try {
-    const stats = await db.query(`
-      SELECT 
-        COUNT(*) as total,
-        COUNT(*) FILTER (WHERE status = 'running') as running,
-        COUNT(*) FILTER (WHERE status = 'completed') as completed,
-        COUNT(*) FILTER (WHERE status = 'failed') as failed
-      FROM workflow_instances
-      WHERE created_at > NOW() - INTERVAL '24 hours'
-    `);
-    
-    const data = {
-      type: 'stats_update',
-      data: stats.rows[0]
-    };
-    
-    if (ws) {
-      ws.send(JSON.stringify(data));
-    } else {
-      broadcast(data);
-    }
-  } catch (error) {
-    console.error('Error sending stats:', error);
-  }
-}
-
-// ===== WORKFLOW EXECUTION ENDPOINT =====
-app.post('/api/v1/workflows/execute', async (req, res) => {
-  const { template_name, context } = req.body;
-  
-  // Load template from DB
-  const template = await db.query(
-    'SELECT * FROM workflow_templates WHERE name = $1',
-    [template_name]
-  );
-  
-  if (!template.rows.length) {
-    return res.status(404).json({ error: 'Template not found' });
-  }
-  
-  const definition = template.rows[0].definition_json;
-  
-  // Create workflow instance
-  const instance = await db.query(
-    'INSERT INTO workflow_instances (template_id, status, context_json) VALUES ($1, $2, $3) RETURNING *',
-    [template.rows[0].id, 'pending', JSON.stringify(context)]
-  );
-  
-  const workflowId = instance.rows[0].id;
-  
-  // Publish to event bus for async processing
-  await redis.publish('workflow:created', JSON.stringify({
-    workflow_id: workflowId,
-    template: definition,
-    context
-  }));
-  
-  res.json({
-    workflow_id: workflowId, 
-    status: 'pending',
-    message: 'Workflow queued for execution'
-  });
-});
-
-// ===== WORKFLOW STATUS ENDPOINT =====
+// Workflow Status Endpoint
 app.get('/api/v1/workflows/:id', async (req, res) => {
-  const { id } = req.params;
-  
-  const workflow = await db.query(
-    'SELECT w.*, t.jules_task_id, t.pr_url FROM workflow_instances w LEFT JOIN jules_tasks t ON t.workflow_instance_id = w.id WHERE w.id = $1',
-    [id]
-  );
-  
-  if (!workflow.rows.length) {
-    return res.status(404).json({ error: 'Workflow not found' });
+  if (!db) {
+    return res.status(503).json({ error: 'Database not configured' });
   }
   
-  res.json(workflow.rows[0]);
-});
-
-// ===== GITHUB WEBHOOK RECEIVER =====
-app.post('/api/v1/webhooks/github', async (req, res) => {
-  const event = req.headers['x-github-event'];
-  const payload = req.body;
-  
-  // Route to appropriate handler based on event type
-  if (event === 'issues' && payload.action === 'labeled') {
-    const label = payload.label.name;
-    const repo = payload.repository.full_name;
-    
-    // Check if label matches any workflow trigger
-    const template = await db.query(
-      "SELECT * FROM workflow_templates WHERE definition_json->>'trigger'->>'label' = $1",
-      [label]
+  try {
+    const workflow = await db.query(
+      'SELECT * FROM workflow_instances WHERE id = $1',
+      [req.params.id]
     );
     
-    if (template.rows.length) {
-      // Execute workflow
-      await redis.publish('workflow:created', JSON.stringify({
-        template: template.rows[0].definition_json,
-        context: {
-          repo_name: repo,
-          issue_title: payload.issue.title,
-          issue_body: payload.issue.body,
-          issue_number: payload.issue.number,
-          trigger_issue_number: payload.issue.number
-        }
-      }));
+    if (!workflow.rows.length) {
+      return res.status(404).json({ error: 'Workflow not found' });
     }
+    
+    res.json(workflow.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
+});
+
+// GitHub Webhook Receiver
+app.post('/api/v1/webhooks/github', async (req, res) => {
+  const event = req.headers['x-github-event'];
+  console.log('Received GitHub webhook: ' + event);
+  
+  broadcast({
+    type: 'github_webhook',
+    event,
+    payload: req.body,
+    timestamp: new Date().toISOString()
+  });
   
   res.status(200).json({ received: true });
 });
 
-// ===== WORKFLOW PROCESSOR (Background Worker) =====
-async function processWorkflow(message) {
-  const { workflow_id, template, context } = JSON.parse(message);
-  const timer = metrics.workflowDuration.startTimer({ template: template.name });
-  
-  try {
-    // Update status
-    await db.query('UPDATE workflow_instances SET status = $1 WHERE id = $2', ['running', workflow_id]);
-    notifyWorkflowUpdate(workflow_id, { status: 'running' });
-    metrics.activeWorkflows.inc();
-    
-    // Execute pre_actions
-    if (template.pre_actions) {
-      for (const action of template.pre_actions) {
-        await executeAction(action, context, workflow_id);
-      }
-    }
-    
-    // Substitute template variables in task description
-    const task = substituteVariables(template.task, context);
-    
-    // Create Jules task
-    const julesResponse = await julesClient.post('/tasks', {
-      repository: task.repo,
-      title: task.title,
-      description: task.description,
-      labels: task.labels
-    });
-    
-    const julesTaskId = julesResponse.data.id;
-    metrics.julesTaskCounter.inc({ status: 'created' });
-    
-    // Store Jules task reference
-    await db.query(
-      'INSERT INTO jules_tasks (workflow_instance_id, jules_task_id, status) VALUES ($1, $2, $3)',
-      [workflow_id, julesTaskId, 'created']
-    );
-    
-    // Poll for Jules task completion (or set up webhook listener)
-    pollJulesTask(workflow_id, julesTaskId, template, context, timer);
-    
-  } catch (error) {
-    await db.query('UPDATE workflow_instances SET status = $1 WHERE id = $2', ['failed', workflow_id]);
-    notifyWorkflowUpdate(workflow_id, { status: 'failed', error: error.message });
-    console.error('Workflow execution failed:', error);
-    metrics.workflowCounter.inc({ template: template.name, status: 'failed' });
-    metrics.activeWorkflows.dec();
-    timer({ status: 'failed' });
-  }
-}
-
-// Subscribe to workflow events
-redis.subscribe('workflow:created', processWorkflow);
-
-// ===== HELPER FUNCTIONS =====
-function substituteVariables(obj, context) {
-  const json = JSON.stringify(obj);
-  const substituted = json.replace(/\{\{(.+?)\}\}/g, (_, key) => context[key] || '');
-  return JSON.parse(substituted);
-}
-
-async function executeAction(action, context, workflowId) {
-  try {
-      // Implementation for each action type
-      if (action.type === 'notify' && action.target === 'slack') {
-        // Send Slack notification
-        if (process.env.SLACK_WEBHOOK_URL) {
-            await axios.post(process.env.SLACK_WEBHOOK_URL, {
-                text: substituteVariables({ text: action.message }, context).text
-            });
-        }
-      } else if (action.type === 'github_comment') {
-        // Post GitHub comment
-        const [owner, repo] = context.repo_name.split('/');
-        await githubClient.post(`/repos/${owner}/${repo}/issues/${context.issue_number}/comments`, {
-          body: substituteVariables({ text: action.message }, context).text
-        });
-      }
-      // ... implement other action types
-      
-      // Log action
-      await db.query(
-        'INSERT INTO action_log (workflow_instance_id, action_type, result) VALUES ($1, $2, $3)',
-        [workflowId, action.type, 'success']
-      );
-      metrics.actionCounter.inc({ action_type: action.type, success: 'true' });
-  } catch (e) {
-      metrics.actionCounter.inc({ action_type: action.type, success: 'false' });
-      throw e;
-  }
-}
-
-async function pollJulesTask(workflowId, julesTaskId, template, context, timer) {
-  const poll = setInterval(async () => {
-    try {
-      const status = await julesClient.get(`/tasks/${julesTaskId}`);
-      const taskStatus = status.data.status;
-      
-      await db.query(
-        'UPDATE jules_tasks SET status = $1, pr_url = $2 WHERE jules_task_id = $3',
-        [taskStatus, status.data.pr_url, julesTaskId]
-      );
-      
-      if (taskStatus === 'completed') {
-        clearInterval(poll);
-        
-        // Execute post_actions
-        if (template.post_actions) {
-          for (const action of template.post_actions) {
-            await executeAction(action, { ...context, pr_url: status.data.pr_url }, workflowId);
-          }
-        }
-        
-        await db.query('UPDATE workflow_instances SET status = $1 WHERE id = $2', ['completed', workflowId]);
-        notifyWorkflowUpdate(workflowId, { status: 'completed', pr_url: status.data.pr_url });
-        sendStats();
-        
-        metrics.workflowCounter.inc({ template: template.name, status: 'completed' });
-        metrics.julesTaskCounter.inc({ status: 'completed' });
-        metrics.activeWorkflows.dec();
-        timer({ status: 'completed' });
-
-      } else if (taskStatus === 'failed') {
-        clearInterval(poll);
-        await db.query('UPDATE workflow_instances SET status = $1 WHERE id = $2', ['failed', workflowId]);
-        notifyWorkflowUpdate(workflowId, { status: 'failed' });
-        
-        metrics.workflowCounter.inc({ template: template.name, status: 'failed' });
-        metrics.julesTaskCounter.inc({ status: 'failed' });
-        metrics.activeWorkflows.dec();
-        timer({ status: 'failed' });
-      }
-    } catch (error) {
-      console.error('Error polling Jules task:', error);
-    }
-  }, 30000); // Poll every 30 seconds
-}
-
 // Start server
 server.listen(PORT, () => {
-  console.log(`Jules Orchestrator API with WebSocket running on port ${PORT}`);
+  console.log('Jules Orchestrator API running on port ' + PORT);
+  console.log('Health check: http://localhost:' + PORT + '/api/v1/health');
+  console.log('MCP Tools: http://localhost:' + PORT + '/mcp/tools');
+  console.log('Jules API Key: ' + (JULES_API_KEY ? 'Configured' : 'Not set'));
+  console.log('GitHub Token: ' + (GITHUB_TOKEN ? 'Configured' : 'Not set'));
+  console.log('Database: ' + (DATABASE_URL ? 'Configured' : 'Not set'));
 });
