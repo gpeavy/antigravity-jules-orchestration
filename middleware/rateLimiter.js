@@ -20,6 +20,18 @@ import crypto from 'crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+/**
+ * Validate Redis URL uses TLS in production
+ */
+function validateRedisUrl(url) {
+  const isProduction = process.env.NODE_ENV === 'production';
+  if (isProduction && url && !url.startsWith('rediss://')) {
+    console.warn('[RateLimiter] SECURITY WARNING: Redis connection should use TLS (rediss://) in production');
+  }
+  return url;
+}
+
+
 
 /**
  * Rate Limit Error with proper headers
@@ -40,14 +52,14 @@ export class RedisRateLimiter {
   constructor(config = {}) {
     this.config = {
       redis: {
-        url: process.env.REDIS_URL || 'redis://localhost:6379',
+        url: validateRedisUrl(process.env.REDIS_URL) || 'redis://localhost:6379',
         connectTimeout: 5000,
         ...config.redis
       },
       tiers: config.tiers || {
         free: { requestsPerMinute: 100, burstCapacity: 150, refillRate: 1.67, windowMs: 60000 },
         pro: { requestsPerMinute: 1000, burstCapacity: 1500, refillRate: 16.67, windowMs: 60000 },
-        enterprise: { requestsPerMinute: 10000, burstCapacity: 15000, refillRate: 166.67, windowMs: 60000, bypassRateLimiting: true }
+        enterprise: { requestsPerMinute: 100000, burstCapacity: 150000, refillRate: 1666.67, windowMs: 60000 }
       },
       failover: {
         strategy: config.failover?.strategy || 'fail-closed',
@@ -93,10 +105,10 @@ export class RedisRateLimiter {
       });
 
       this.client.on('error', (err) => {
+        // SECURITY: Never log stack traces - they may contain connection strings
         console.error('[RateLimiter] Redis error:', {
           message: err.message,
           code: err.code,
-          stack: err.stack,
           errno: err.errno,
           syscall: err.syscall
         });
@@ -129,11 +141,11 @@ export class RedisRateLimiter {
       this.metrics.initializationError = error.message;
 
       // Log with FULL error details including stack trace
+      // SECURITY: Never log stack traces - they may contain connection strings
       console.error('[RateLimiter] CRITICAL: Initialization failed:', {
         error: error.message,
-        stack: error.stack,
         code: error.code,
-        redisUrl: this.config.redis.url.replace(/\/\/.*@/, '//***@'), // Mask credentials
+        redisUrl: this.config.redis.url ? '[MASKED]' : 'not configured',
         failoverStrategy: this.config.failover.strategy
       });
 
@@ -361,14 +373,19 @@ export class RedisRateLimiter {
    * Extract API key from request
    */
   extractApiKey(req) {
-    // Priority: x-api-key header > Authorization Bearer > query param > IP
+    // SECURITY: Only accept API keys from headers (not query strings - they get logged)
+    // SECURITY: Use socket address directly to prevent X-Forwarded-For spoofing
     const apiKey =
       req.headers['x-api-key'] ||
       req.headers.authorization?.replace(/^Bearer\s+/i, '') ||
-      req.query.api_key ||
-      req.ip ||
+      req.socket?.remoteAddress ||  // Direct socket - not spoofable
       req.connection?.remoteAddress ||
       'anonymous';
+
+    // Log warning if API key was in query string (deprecated)
+    if (req.query.api_key) {
+      console.warn('[RateLimiter] SECURITY: API key in query string is deprecated and ignored');
+    }
 
     return apiKey;
   }
@@ -412,7 +429,6 @@ export class RedisRateLimiter {
 
         console.error('[RateLimiter] CRITICAL: Failed to get tier from Redis - user may be downgraded:', {
           error: error.message,
-          stack: error.stack,
           apiKeyHash: this.hashKey(apiKey),
           isConnected: this.isConnected
         });
@@ -451,9 +467,9 @@ export class RedisRateLimiter {
       return { persisted: true, cached: true };
     } catch (error) {
       this.metrics.redisErrors++;
+      // SECURITY: Never log stack traces - they may contain connection strings
       console.error('[RateLimiter] Failed to persist tier to Redis:', {
         error: error.message,
-        stack: error.stack,
         apiKeyHash: this.hashKey(apiKey),
         tier
       });
