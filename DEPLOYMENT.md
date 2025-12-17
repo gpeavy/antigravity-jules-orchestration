@@ -2,28 +2,40 @@
 
 ## 🚀 Deployment Status
 
-✅ **LIVE & OPERATIONAL**
+✅ **LIVE & FULLY OPERATIONAL**
 
 - **Service URL**: https://antigravity-jules-orchestration.onrender.com
 - **Deployment Platform**: Render (Free Tier)
 - **Region**: Oregon (US West)
 - **Runtime**: Node.js 22.16.0
-- **Status**: Deployed and Healthy
-- **Last Deploy**: December 1, 2025 at 4:16 AM EST
+- **Version**: 2.3.0
+- **Status**: All services configured and healthy
+- **Last Deploy**: December 17, 2025
 
 ---
 
 ## 📋 Service Configuration
 
 ### Environment Variables
-- `JULES_API_KEY`: ✅ Configured (stored in Render environment)
-- `PORT`: 10000 (Render auto-assigned)
+| Variable | Status | Description |
+|----------|--------|-------------|
+| `JULES_API_KEY` | ✅ Configured | Jules API authentication key |
+| `GITHUB_TOKEN` | ✅ Configured | GitHub personal access token |
+| `DATABASE_URL` | ✅ Configured | PostgreSQL connection (linked via Render) |
+| `PORT` | Auto-assigned | Render assigns port 10000 |
+
+### Database
+- **Type**: PostgreSQL 17
+- **Name**: orchestrator-db (jules_orchestrator)
+- **Connection**: Internal via Render datastore linking
+- **Auto-configured**: DATABASE_URL populated automatically
 
 ### GitHub Integration
 - **Repository**: https://github.com/Scarmonit/antigravity-jules-orchestration
 - **Branch**: Scarmonit
 - **Auto-Deploy**: Enabled (triggers on git push)
-- **Secrets**: JULES_API_KEY stored in GitHub Actions
+- **Token Scopes**: repo, workflow, admin:repo_hook
+- **Connected Sources**: Scarmonit/antigravity-jules-orchestration
 
 ### Build Configuration
 - **Build Command**: `npm install`
@@ -58,8 +70,16 @@
 ```json
 {
   "status": "ok",
-  "apiKeyConfigured": true,
-  "timestamp": "2025-12-01T09:21:17.442Z"
+  "version": "2.3.0",
+  "timestamp": "2025-12-17T04:32:01.380Z",
+  "uptime": 53.53,
+  "memory": {"used": "10MB", "total": "11MB"},
+  "services": {
+    "julesApi": "configured",
+    "database": "configured",
+    "github": "configured"
+  },
+  "circuitBreaker": {"failures": 0, "isOpen": false}
 }
 ```
 
@@ -171,17 +191,33 @@ curl http://localhost:3323/health
 
 ## 🔐 Security Configuration
 
-### API Key Management
-- ✅ JULES_API_KEY stored securely in Render environment variables
-- ✅ GitHub Actions secret configured for CI/CD
-- ✅ API key never exposed in logs or code repository
+### Secrets Management
+| Secret | Storage | Rotation |
+|--------|---------|----------|
+| `JULES_API_KEY` | Render environment | As needed |
+| `GITHUB_TOKEN` | Render environment | 90 days recommended |
+| `DATABASE_URL` | Render (auto-linked) | N/A (internal) |
+
+### Security Measures
+- ✅ All secrets stored in Render environment variables (not in code)
+- ✅ `.env` file in `.gitignore` (never committed)
+- ✅ `.env.render` template contains only placeholders
 - ✅ HTTPS enforced on all connections
+- ✅ Internal database URL (not exposed externally)
+- ✅ Circuit breaker prevents cascading failures
+
+### Token Scope Recommendations
+The GitHub token should have minimal required scopes:
+- `repo` - Repository access for Jules sessions
+- `workflow` - CI/CD workflow triggers
+- `admin:repo_hook` - Webhook management
 
 ### Best Practices
 1. Never commit `.env` files to version control
-2. Rotate API keys regularly
-3. Use GitHub Secrets for CI/CD workflows
+2. Use `.env.render` template for documenting required variables
+3. Rotate tokens every 90 days
 4. Monitor service logs for unauthorized access attempts
+5. Use Render's internal URLs for database connections
 
 ---
 
@@ -236,4 +272,5 @@ curl http://localhost:3323/health
 ---
 
 **Deployment Completed**: ✅ Service is live and ready for Antigravity integration
-**Last Updated**: December 1, 2025
+**Version**: 2.3.0
+**Last Updated**: December 17, 2025
