@@ -4,42 +4,6 @@ import https from 'https';
 import { getIssue, getIssuesByLabel, formatIssueForPrompt } from './lib/github.js';
 import { BatchProcessor } from './lib/batch.js';
 import { SessionMonitor } from './lib/monitor.js';
-import { ollamaCompletion, listOllamaModels, ollamaCodeGeneration, ollamaChat } from './lib/ollama.js';
-import { ragIndexDirectory, ragQuery, ragStatus, ragClear } from './lib/rag.js';
-import {
-  storeSessionOutcome,
-  recallContextForTask,
-  reinforceSuccessfulPattern,
-  checkMemoryHealth,
-  getMemoryMaintenanceSchedule,
-  searchSessionMemories,
-  getRelatedMemories,
-  decayOldMemories,
-} from './lib/memory-client.js';
-import {
-  isConfigured as isRenderConfigured,
-  connect as renderConnect,
-  disconnect as renderDisconnect,
-  listServices as renderListServices,
-  listDeploys as renderListDeploys,
-  getBuildLogs as renderGetBuildLogs,
-  getLatestFailedDeploy as renderGetLatestFailedDeploy,
-  analyzeErrors as renderAnalyzeErrors,
-} from './lib/render-client.js';
-import {
-  handleWebhook as handleRenderWebhook,
-  getAutoFixStatus as getRenderAutoFixStatus,
-  setAutoFixEnabled as setRenderAutoFixEnabled,
-  addMonitoredService as addRenderMonitoredService,
-  removeMonitoredService as removeRenderMonitoredService,
-  startAutoFix as startRenderAutoFix,
-  startCleanupInterval as startRenderCleanupInterval,
-} from './lib/render-autofix.js';
-import {
-  getSuggestedTasks,
-  clearCache as clearSuggestedTasksCache,
-  generateFixPrompt as generateSuggestedTaskFixPrompt,
-} from './lib/suggested-tasks.js';
 import compressionMiddleware from './middleware/compressionMiddleware.js';
 import validateRequest from './middleware/validateRequest.js';
 import mcpExecuteSchema from './schemas/mcp-execute-schema.js';
@@ -269,7 +233,7 @@ app.get('/', (req, res) => {
     service: 'Jules MCP Server',
     version: VERSION,
     timestamp: new Date().toISOString(),
-    capabilities: ['sessions', 'tasks', 'orchestration', 'mcp-protocol', 'sources', 'batch', 'monitor', 'github', 'qwen'],
+    capabilities: ['sessions', 'tasks', 'orchestration', 'mcp-protocol', 'sources', 'batch', 'monitor', 'github'],
     authMethod: 'api-key',
     endpoints: {
       health: '/health',
@@ -294,9 +258,7 @@ app.get(['/health', '/api/v1/health'], async (req, res) => {
     },
     services: {
       julesApi: 'unknown',
-      database: process.env.DATABASE_URL ? 'configured' : 'not_configured',
-      github: GITHUB_TOKEN ? 'configured' : 'not_configured',
-      semanticMemory: process.env.SEMANTIC_MEMORY_URL ? 'configured' : 'not_configured'
+      github: GITHUB_TOKEN ? 'configured' : 'not_configured'
     },
     circuitBreaker: {
       failures: circuitBreaker.failures,
@@ -358,26 +320,6 @@ app.get('/api/sessions/:id/timeline', async (req, res) => {
     const timeline = await sessionMonitor.getSessionTimeline(req.params.id);
     res.json(timeline);
   } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ============ WEBHOOKS ============
-
-// Render webhook for build failure auto-fix
-app.post('/webhooks/render', async (req, res) => {
-  console.log('[Webhook] Received Render webhook');
-
-  try {
-    const result = await handleRenderWebhook(
-      req,
-      createJulesSession,
-      (sessionId, msg) => julesRequest('POST', `/sessions/${sessionId}:sendMessage`, msg)
-    );
-
-    res.status(result.status || 200).json(result);
-  } catch (error) {
-    console.error('[Webhook] Error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });
@@ -499,66 +441,6 @@ app.get('/mcp/tools', cacheMiddleware, (req, res) => {
           sessionId: { type: 'string', required: true, description: 'Session ID' }
         }
       },
-      // NEW: Ollama Local LLM Integration
-      {
-        name: 'ollama_list_models',
-        description: 'List available local Ollama models',
-        parameters: {}
-      },
-      {
-        name: 'ollama_completion',
-        description: 'Generate text using local Ollama models',
-        parameters: {
-          prompt: { type: 'string', required: true, description: 'Text prompt' },
-          model: { type: 'string', required: false, description: 'Model name (default: qwen2.5-coder:7b)' },
-          systemPrompt: { type: 'string', required: false, description: 'System prompt' }
-        }
-      },
-      {
-        name: 'ollama_code_generation',
-        description: 'Generate code using local Qwen2.5-Coder model',
-        parameters: {
-          task: { type: 'string', required: true, description: 'Code generation task' },
-          language: { type: 'string', required: false, description: 'Programming language (default: javascript)' },
-          context: { type: 'string', required: false, description: 'Additional context' }
-        }
-      },
-      {
-        name: 'ollama_chat',
-        description: 'Multi-turn chat with local Ollama model',
-        parameters: {
-          messages: { type: 'array', required: true, description: 'Array of {role, content} messages' },
-          model: { type: 'string', required: false, description: 'Model name (default: qwen2.5-coder:7b)' }
-        }
-      },
-      // NEW: RAG (Retrieval-Augmented Generation)
-      {
-        name: 'ollama_rag_index',
-        description: 'Index a directory for RAG-powered codebase queries',
-        parameters: {
-          directory: { type: 'string', required: true, description: 'Directory path to index' },
-          maxFiles: { type: 'number', required: false, description: 'Max files to index (default: 100)' }
-        }
-      },
-      {
-        name: 'ollama_rag_query',
-        description: 'Query the indexed codebase with context-aware LLM responses',
-        parameters: {
-          query: { type: 'string', required: true, description: 'Question about the codebase' },
-          model: { type: 'string', required: false, description: 'Model to use (default: qwen2.5-coder:7b)' },
-          topK: { type: 'number', required: false, description: 'Number of context chunks (default: 5)' }
-        }
-      },
-      {
-        name: 'ollama_rag_status',
-        description: 'Get RAG index status and indexed files',
-        parameters: {}
-      },
-      {
-        name: 'ollama_rag_clear',
-        description: 'Clear the RAG index',
-        parameters: {}
-      },
       // v2.5.0: Session Management
       { name: 'jules_cancel_session', description: 'Cancel/abort an active session', parameters: { sessionId: { type: 'string', required: true } } },
       { name: 'jules_retry_session', description: 'Retry a failed session', parameters: { sessionId: { type: 'string', required: true }, modifiedPrompt: { type: 'string', required: false } } },
@@ -587,33 +469,7 @@ app.get('/mcp/tools', cacheMiddleware, (req, res) => {
       { name: 'jules_clear_queue', description: 'Clear queue', parameters: {} },
       // v2.5.0: Analytics
       { name: 'jules_batch_retry_failed', description: 'Retry failed sessions in batch', parameters: { batchId: { type: 'string', required: true } } },
-      { name: 'jules_get_analytics', description: 'Get session analytics', parameters: { days: { type: 'number' } } },
-      // Semantic Memory Integration (v2.5.2)
-      { name: 'memory_recall_context', description: 'Recall relevant memories for a task', parameters: { task: { type: 'string', required: true }, repository: { type: 'string' }, limit: { type: 'number' } } },
-      { name: 'memory_store', description: 'Store a memory manually', parameters: { content: { type: 'string', required: true }, summary: { type: 'string' }, tags: { type: 'array' }, importance: { type: 'number' } } },
-      { name: 'memory_search', description: 'Search memories by query', parameters: { query: { type: 'string', required: true }, tags: { type: 'array' }, limit: { type: 'number' } } },
-      { name: 'memory_related', description: 'Get memories related to a specific memory', parameters: { memoryId: { type: 'string', required: true }, limit: { type: 'number' } } },
-      { name: 'memory_reinforce', description: 'Reinforce a memory when a pattern proves successful', parameters: { memoryId: { type: 'string', required: true }, boost: { type: 'number' } } },
-      { name: 'memory_forget', description: 'Apply decay to old memories or remove them', parameters: { olderThanDays: { type: 'number' }, belowImportance: { type: 'number' }, soft: { type: 'boolean' }, decayFactor: { type: 'number' } } },
-      { name: 'memory_health', description: 'Check semantic memory service health', parameters: {} },
-      { name: 'memory_maintenance_schedule', description: 'Get memory maintenance schedule for temporal-agent-mcp', parameters: {} },
-      // v2.6.0: Render Integration (Auto-Fix)
-      { name: 'render_connect', description: 'Connect Render integration by storing API key', parameters: { apiKey: { type: 'string', required: true, description: 'Render API key (starts with rnd_)' }, webhookSecret: { type: 'string', required: false, description: 'Webhook secret for signature verification' } } },
-      { name: 'render_disconnect', description: 'Disconnect Render integration', parameters: {} },
-      { name: 'render_status', description: 'Check Render integration status', parameters: {} },
-      { name: 'render_list_services', description: 'List all Render services', parameters: {} },
-      { name: 'render_list_deploys', description: 'List deploys for a service', parameters: { serviceId: { type: 'string', required: true, description: 'Service ID (srv-xxx)' }, limit: { type: 'number', required: false } } },
-      { name: 'render_get_build_logs', description: 'Get build logs for a deploy', parameters: { serviceId: { type: 'string', required: true }, deployId: { type: 'string', required: true } } },
-      { name: 'render_analyze_failure', description: 'Analyze a build failure and get fix suggestions', parameters: { serviceId: { type: 'string', required: true } } },
-      { name: 'render_autofix_status', description: 'Get auto-fix status and active operations', parameters: {} },
-      { name: 'render_set_autofix', description: 'Enable or disable auto-fix for Jules PRs', parameters: { enabled: { type: 'boolean', required: true } } },
-      { name: 'render_add_monitored_service', description: 'Add a service to auto-fix monitoring', parameters: { serviceId: { type: 'string', required: true } } },
-      { name: 'render_remove_monitored_service', description: 'Remove a service from auto-fix monitoring', parameters: { serviceId: { type: 'string', required: true } } },
-      { name: 'render_trigger_autofix', description: 'Manually trigger auto-fix for a failed deploy', parameters: { serviceId: { type: 'string', required: true }, deployId: { type: 'string', required: true } } },
-      // v2.6.0: Suggested Tasks
-      { name: 'jules_suggested_tasks', description: 'Scan codebase for TODO/FIXME/HACK comments and suggest tasks for Jules', parameters: { directory: { type: 'string', required: true, description: 'Directory to scan' }, types: { type: 'array', required: false, description: 'Filter by comment types (todo, fixme, hack, bug, etc.)' }, minPriority: { type: 'number', required: false, description: 'Minimum priority threshold (1-10)' }, limit: { type: 'number', required: false, description: 'Max tasks to return (default: 20)' }, includeGitInfo: { type: 'boolean', required: false, description: 'Include git blame info for each task' } } },
-      { name: 'jules_fix_suggested_task', description: 'Create a Jules session to fix a suggested task', parameters: { directory: { type: 'string', required: true }, taskIndex: { type: 'number', required: true, description: 'Index of task from jules_suggested_tasks result' }, source: { type: 'string', required: true, description: 'GitHub source (sources/github/owner/repo)' } } },
-      { name: 'jules_clear_suggested_cache', description: 'Clear suggested tasks cache', parameters: {} }
+      { name: 'jules_get_analytics', description: 'Get session analytics', parameters: { days: { type: 'number' } } }
     ]
   });
 });
@@ -654,18 +510,6 @@ function initializeToolRegistry() {
   toolRegistry.set('jules_monitor_all', (p) => sessionMonitor.monitorAll());
   toolRegistry.set('jules_session_timeline', (p) => sessionMonitor.getSessionTimeline(p.sessionId));
 
-  // Ollama Local LLM
-  toolRegistry.set('ollama_list_models', (p) => listOllamaModels());
-  toolRegistry.set('ollama_completion', (p) => ollamaCompletion(p));
-  toolRegistry.set('ollama_code_generation', (p) => ollamaCodeGeneration(p));
-  toolRegistry.set('ollama_chat', (p) => ollamaChat(p));
-
-  // RAG Tools
-  toolRegistry.set('ollama_rag_index', (p) => ragIndexDirectory(p));
-  toolRegistry.set('ollama_rag_query', (p) => ragQuery(p));
-  toolRegistry.set('ollama_rag_status', (p) => ragStatus());
-  toolRegistry.set('ollama_rag_clear', (p) => ragClear());
-
   // v2.5.0: Session Management
   toolRegistry.set('jules_cancel_session', (p) => cancelSession(p.sessionId));
   toolRegistry.set('jules_retry_session', (p) => retrySession(p.sessionId, p.modifiedPrompt));
@@ -700,67 +544,6 @@ function initializeToolRegistry() {
   // v2.5.0: Batch Retry & Analytics
   toolRegistry.set('jules_batch_retry_failed', (p) => batchRetryFailed(p.batchId));
   toolRegistry.set('jules_get_analytics', (p) => getAnalytics(p.days));
-
-  // v2.5.2: Semantic Memory Integration
-  toolRegistry.set('memory_recall_context', (p) => recallContextForTask(p.task, p.repository));
-  toolRegistry.set('memory_store', (p) => storeManualMemory(p));
-  toolRegistry.set('memory_search', (p) => searchMemories(p));
-  toolRegistry.set('memory_related', (p) => getRelatedMemories(p.memoryId, p.limit));
-  toolRegistry.set('memory_reinforce', (p) => reinforceSuccessfulPattern(p.memoryId, p.boost));
-  toolRegistry.set('memory_forget', (p) => decayOldMemories(p.olderThanDays, p.belowImportance));
-  toolRegistry.set('memory_health', () => checkMemoryHealth().then(healthy => ({ healthy, url: process.env.SEMANTIC_MEMORY_URL || 'not configured' })));
-  toolRegistry.set('memory_maintenance_schedule', () => getMemoryMaintenanceSchedule());
-
-  // v2.6.0: Render Integration for Auto-Fix
-  toolRegistry.set('render_connect', (p) => renderConnect(p.apiKey, p.webhookSecret));
-  toolRegistry.set('render_disconnect', () => renderDisconnect());
-  toolRegistry.set('render_status', () => ({ configured: isRenderConfigured(), autoFix: getRenderAutoFixStatus() }));
-  toolRegistry.set('render_list_services', () => renderListServices());
-  toolRegistry.set('render_list_deploys', (p) => renderListDeploys(p.serviceId, p.limit));
-  toolRegistry.set('render_get_build_logs', (p) => renderGetBuildLogs(p.serviceId, p.deployId));
-  toolRegistry.set('render_analyze_failure', async (p) => {
-    const failure = await renderGetLatestFailedDeploy(p.serviceId);
-    if (!failure.found) return failure;
-    return renderAnalyzeErrors(failure.logs);
-  });
-  toolRegistry.set('render_autofix_status', () => getRenderAutoFixStatus());
-  toolRegistry.set('render_set_autofix', (p) => setRenderAutoFixEnabled(p.enabled));
-  toolRegistry.set('render_add_monitored_service', (p) => addRenderMonitoredService(p.serviceId));
-  toolRegistry.set('render_remove_monitored_service', (p) => removeRenderMonitoredService(p.serviceId));
-  toolRegistry.set('render_trigger_autofix', async (p) => {
-    // Manual trigger for auto-fix on a specific service
-    const failure = await renderGetLatestFailedDeploy(p.serviceId);
-    if (!failure.found) return { success: false, message: 'No recent failed deploy found' };
-    return startRenderAutoFix(
-      { serviceId: p.serviceId, deployId: failure.deploy.id, branch: failure.branch },
-      createJulesSession,
-      (sessionId, msg) => julesRequest('POST', `/sessions/${sessionId}:sendMessage`, msg)
-    );
-  });
-
-  // v2.6.0: Suggested Tasks
-  toolRegistry.set('jules_suggested_tasks', (p) => getSuggestedTasks(p.directory, {
-    types: p.types,
-    minPriority: p.minPriority,
-    limit: p.limit,
-    includeGitInfo: p.includeGitInfo
-  }));
-  toolRegistry.set('jules_fix_suggested_task', async (p) => {
-    // Get suggested tasks and find the one at the specified index
-    const result = getSuggestedTasks(p.directory, { limit: 100 });
-    if (p.taskIndex < 0 || p.taskIndex >= result.tasks.length) {
-      return { success: false, error: `Invalid task index: ${p.taskIndex}. Found ${result.tasks.length} tasks.` };
-    }
-    const task = result.tasks[p.taskIndex];
-    const prompt = generateSuggestedTaskFixPrompt(task, p.directory);
-    return createJulesSession({
-      prompt,
-      source: p.source,
-      title: `Fix ${task.type}: ${task.text.substring(0, 50)}...`,
-      automationMode: 'AUTO_CREATE_PR'
-    });
-  });
-  toolRegistry.set('jules_clear_suggested_cache', () => clearSuggestedTasksCache());
 }
 
 // MCP Protocol - Execute tool with O(1) registry lookup
@@ -876,23 +659,6 @@ async function createJulesSession(config) {
     validationError.statusCode = 400; // Bad Request
     throw validationError;
   }
-  // Recall relevant context from semantic memory before creating session
-  let memoryContext = null;
-  if (process.env.SEMANTIC_MEMORY_URL && config.prompt) {
-    try {
-      const contextResult = await recallContextForTask(config.prompt, config.source);
-      if (contextResult.success && contextResult.memories?.length > 0) {
-        memoryContext = contextResult;
-        structuredLog('info', 'Recalled memory context for session', {
-          memoryCount: contextResult.memories.length,
-          source: config.source
-        });
-      }
-    } catch (err) {
-      structuredLog('warn', 'Failed to recall memory context', { error: err.message });
-    }
-  }
-
   // Determine the starting branch - required by Jules API
   let startingBranch = config.branch;
 
@@ -916,15 +682,8 @@ async function createJulesSession(config) {
     }
   }
 
-  // Enhance prompt with memory context if available
-  let enhancedPrompt = config.prompt;
-  if (memoryContext?.suggestions) {
-    enhancedPrompt = `${config.prompt}\n\n---\n${memoryContext.suggestions}`;
-    structuredLog('info', 'Enhanced prompt with memory context');
-  }
-
   const sessionData = {
-    prompt: enhancedPrompt,
+    prompt: config.prompt,
     sourceContext: {
       source: config.source,
       githubRepoContext: {
@@ -1184,19 +943,6 @@ async function mergePr(owner, repo, prNumber, mergeMethod = 'squash') {
       let data = ''; res.on('data', chunk => data += chunk);
       res.on('end', async () => {
         if (res.statusCode >= 200 && res.statusCode < 300) {
-          // Store successful merge in semantic memory
-          if (process.env.SEMANTIC_MEMORY_URL) {
-            try {
-              await storeSessionOutcome(
-                { title: `PR #${prNumber} merged`, sourceContext: { source: `sources/github/${owner}/${repo}` } },
-                'completed',
-                { prUrl: `https://github.com/${owner}/${repo}/pull/${prNumber}`, merged: true }
-              );
-              structuredLog('info', 'Stored PR merge in semantic memory', { owner, repo, prNumber });
-            } catch (err) {
-              structuredLog('warn', 'Failed to store PR merge in memory', { error: err.message });
-            }
-          }
           resolve({ success: true, merged: true, prNumber });
         } else {
           const errMsg = res.statusCode === 403 ? 'Permission denied' : res.statusCode === 404 ? 'PR not found' : res.statusCode === 422 ? 'PR cannot be merged' : 'Merge failed';
@@ -1267,50 +1013,6 @@ async function batchRetryFailed(batchId) {
   return { batchId, totalRetried: failedTasks.length, successful: results.filter(r => r.success).length, failed: results.filter(r => !r.success).length, results };
 }
 
-// ============ SEMANTIC MEMORY HELPERS ============
-
-// Store a manual memory
-async function storeManualMemory(params) {
-  if (!process.env.SEMANTIC_MEMORY_URL) {
-    return { success: false, error: 'SEMANTIC_MEMORY_URL not configured' };
-  }
-
-  try {
-    const response = await fetch(`${process.env.SEMANTIC_MEMORY_URL}/mcp/execute`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        tool: 'store_memory',
-        parameters: {
-          content: params.content,
-          summary: params.summary,
-          tags: params.tags || ['manual', 'jules-orchestration'],
-          importance: params.importance || 0.5,
-          source: 'jules-orchestration',
-        },
-      }),
-    });
-
-    if (!response.ok) {
-      const error = await response.text();
-      return { success: false, error: `Memory API error: ${response.status} - ${error}` };
-    }
-
-    return await response.json();
-  } catch (error) {
-    return { success: false, error: error.message };
-  }
-}
-
-// Search memories
-async function searchMemories(params) {
-  if (!process.env.SEMANTIC_MEMORY_URL) {
-    return { success: false, error: 'SEMANTIC_MEMORY_URL not configured' };
-  }
-
-  return await searchSessionMemories(params.query, params.tags);
-}
-
 // Analytics
 async function getAnalytics(days = 7) {
   const allSessions = await julesRequest('GET', '/sessions');
@@ -1364,9 +1066,6 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log('MCP Tools: http://localhost:' + PORT + '/mcp/tools');
   console.log('Jules API Key configured: ' + (JULES_API_KEY ? 'Yes' : 'No'));
   console.log('GitHub Token configured: ' + (GITHUB_TOKEN ? 'Yes' : 'No'));
-
-  // Start Render webhook cleanup interval
-  startRenderCleanupInterval();
 
   // Initialize modules after server starts
   batchProcessor = new BatchProcessor(julesRequest, createJulesSession);
