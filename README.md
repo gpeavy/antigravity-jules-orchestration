@@ -119,7 +119,7 @@ Autonomous AI orchestration architecture combining **Google Antigravity** with t
 
 ### Setup Steps
 
-1. Clone Repository: git clone https://github.com/Scarmonit/antigravity-jules-orchestration.git
+1. Clone Repository: git clone https://github.com/gpeavy/antigravity-jules-orchestration.git
 2. Install Dependencies: npm install
 3. Configure Environment: cp .env.example .env (add JULES_API_KEY)
 4. Start MCP Server: npm run dev
@@ -142,13 +142,6 @@ Autonomous AI orchestration architecture combining **Google Antigravity** with t
 - **LRU Cache**: 100 item capacity with 10s default TTL
 - **Circuit Breaker**: Trips after 5 consecutive failures, 60s reset
 - **Retry Logic**: 3 retries with exponential backoff and jitter
-
-## Deployment
-
-- **Platform**: Render
-- **Branch**: main
-- **Health Check**: /health
-- **Live URL**: https://scarmonit.com
 
 ## Development
 
